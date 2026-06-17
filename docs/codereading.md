@@ -347,3 +347,239 @@ for transform in transforms:
 - **除 SummaryIndex 和 VectorStoreIndex 外, 其余建索引都需调 LLM**
 - **`from_documents()` 统一入口**: 所有索引都走 BaseIndex._from_documents → run_transformations → _build_index_from_nodes
 - **`as_retriever()` 是多态转换**: 每个索引返回自己的检索器, `as_query_engine()` 和 `as_chat_engine()` 是通用包装
+
+---
+
+## 2026-06-17: VectorStore / Index / Retriever 三者边界
+
+### 一句话定位
+
+| 组件 | 一句话 | 核心接口 |
+|------|--------|----------|
+| **VectorStore** | 引擎 — 底层向量存储与近邻检索 | `add(nodes)`, `query(VectorStoreQuery) → VectorStoreQueryResult` |
+| **Index** | 工厂+编排者 — 管理摄入、维护状态、生产 Retriever | `from_documents(docs)`, `as_retriever(kwargs) → BaseRetriever`, 自己不检索 |
+| **Retriever** | 策略 — 封装查询方式（怎么嵌入、怎么调 VectorStore、怎么组装结果） | `retrieve(str) → List[NodeWithScore]` |
+
+### 依赖链
+
+```
+Index ──owns──→ VectorStore (via StorageContext)
+  │
+  └── as_retriever() ──creates──→ VectorIndexRetriever
+                                      │
+                                      ├── embed query
+                                      ├── vector_store.query()  ← 调 VectorStore
+                                      ├── docstore.get_nodes()  ← 补全 Node 对象
+                                      └── return List[NodeWithScore]
+```
+
+### VectorStore 核心方法 (Protocol)
+
+定义在 `core/vector_stores/types.py:268`，`typing.Protocol` 运行时检查接口：
+
+| 方法 | 签名 | 职责 |
+|------|------|------|
+| `add` | `(nodes: List[BaseNode]) → List[str]` | 写入节点 + embedding，返回 IDs |
+| `delete` | `(ref_doc_id: str) → None` | 按源文档 ID 删除 |
+| `query` | `(query: VectorStoreQuery) → VectorStoreQueryResult` | ANN 近邻搜索 |
+| `stores_text` | `bool` 属性 | 自身是否能完整还原 Node（影响 Index 是否使用 docstore） |
+
+`BasePydanticVectorStore` (ABC) 额外提供 `get_nodes`, `delete_nodes`, `clear` 等。
+
+### `stores_text` 的关键作用
+
+当 `stores_text=True` 时，`VectorStoreIndex._add_nodes_to_index()` (indices/vector_store/base.py:234) 会**跳过写入 docstore/index_struct**，只把 TextNode 存入 VectorStore。只有 ImageNode/IndexNode 这类非文本节点才额外存入 docstore。
+
+这意味着 VectorStore 必须能独立重建完整 Node 对象。
+
+### Index 不自己检索
+
+`BaseIndex` 提供 `as_retriever()`, `as_query_engine()`, `as_chat_engine()` 等工厂方法，
+但**自身不执行检索**。检索逻辑完全委托给 Retriever：
+- `as_retriever()` → `VectorIndexRetriever`
+- `as_query_engine()` → `as_retriever()` + 外套 `RetrieverQueryEngine`
+
+### Milvus 写入手动封装需实现的 3 个核心方法
+
+如果不用官方 `MilvusVectorStore`，自己封装 pymilvus 对接 LlamaIndex，只需实现：
+
+1. **`add(nodes, **kwargs) → List[str]`**
+   - `node_to_metadata_dict(node, remove_text=True, text_field=self.text_key)` 序列化 node
+   - 写入字段：`id`(PK = node.node_id), `text`(node.text), `embedding`(node.embedding)
+   - `_node_content`(JSON blob 含全部元数据), `_node_type`, `ref_doc_id`, `doc_id`
+   - 批量 `self.client.insert(collection_name, data)`
+
+2. **`query(query: VectorStoreQuery, **kwargs) → VectorStoreQueryResult`**
+   - 用 `query.query_embedding` 做 ANN 搜索
+   - 结果中解析 `_node_content` JSON 重建 Node，返回 `VectorStoreQueryResult(nodes=[...], similarities=[...], ids=[...])`
+
+3. **`delete(ref_doc_id: str, **kwargs) → None`**
+   - 先 query 查出 `ref_doc_id` 对应的所有 PK
+   - `self.client.delete(pks=ids)` 批量删除
+
+只需这 3 个方法 + `stores_text = True` 即可接入 `VectorStoreIndex`。
+
+### MilvusVectorStore 写入全流程
+
+```python
+# base.py:436-501
+def add(self, nodes: List[BaseNode], **add_kwargs) -> List[str]:
+    for node in nodes:
+        # 1. 序列化 node 为 metadata dict，清掉 text 和 embedding 避免重复
+        entry = node_to_metadata_dict(node, remove_text=True, text_field=self.text_key)
+        # 2. 单独写 text 列
+        entry[self.text_key] = node.dict()[self.text_key]
+        # 3. PK
+        entry[MILVUS_ID_FIELD] = node.node_id  # "id"
+        # 4. dense embedding
+        entry[self.embedding_field] = node.embedding  # "embedding"
+        # 5. sparse embedding (可选, BGEM3/BM25)
+
+    # 批量 insert/upsert
+    for insert_batch in iter_batch(insert_list, self.batch_size):
+        self.client.insert(collection_name, insert_batch, partition_name=...)
+    return [n.node_id for n in nodes]
+```
+
+Schema 字段：`id`(VARCHAR PK), `text`(VARCHAR), `embedding`(FLOAT_VECTOR), `sparse_embedding`(SPARSE_FLOAT_VECTOR 可选)。
+因为 `enable_dynamic_field=True`，其余元数据（`_node_content`, `_node_type`, `ref_doc_id`, 用户自定义 metadata）自动作为 dynamic fields 存储。
+
+### Binlog 结构 (Milvus 存储层)
+
+Binlog 是 Milvus 的**物理持久化格式**，Segment 是逻辑单元，Binlog 是落盘文件。
+
+**6 种类型**：InsertBinlog(0), DeleteBinlog(1), DDLBinlog(2), IndexFileBinlog(3), StatsBinlog(4), BM25Binlog(5)
+
+**二进制格式**：
+```
+[MagicNumber: 4 bytes = 0xfffabc]
+[DescriptorEvent: collectionID, partitionID, segmentID, fieldID, timestamps, datatype]
+[Event 1: eventHeader + 列数据]
+[Event 2: eventHeader + 列数据]
+...
+```
+
+**三层 Protobuf 结构**：
+```
+SegmentBinlogs          ← 一个 Segment 的完整 binlog 清单
+  ├─ FieldBinlogs[]     ← insert 数据 (每字段一个)
+  ├─ Statslogs[]        ← PK 统计
+  └─ Deltalogs[]        ← 删除记录
+
+FieldBinlog
+  └─ Binlogs[]          ← 该字段可能拆成多个物理文件
+
+Binlog                  ← 单文件描述：LogPath, LogSize, EntriesNum, Timestamps, MemorySize
+```
+
+**写入流程**：`BulkPackWriter.Write()` (flushcommon/syncmgr/pack_writer.go:70) → writeInserts/writeStats/writeDelta/writeBM25Stats → 写入对象存储路径 `{rootPath}/insert_log/{collectionID}/{partitionID}/{segmentID}/{fieldID}/{logID}`
+
+---
+
+## 2026-06-17: VectorStore 与 docstore 的角色定位
+
+### VectorStore — 向量引擎
+
+定义在 `core/vector_stores/types.py:269`，`typing.Protocol` 运行时检查接口。只负责存储和检索 **embedding 向量**：
+- `add(nodes) → List[str]`：存入节点 + 向量
+- `query(VectorStoreQuery) → VectorStoreQueryResult`：ANN 近邻搜索
+- `delete(ref_doc_id)`：按源文档 ID 删除
+
+**只存向量索引，不一定是完整数据**（取决于 `stores_text` 属性）。
+
+### docstore — 文档/节点实体存储
+
+定义在 `core/storage/docstore/types.py:24`，ABC 抽象基类。本质是 **key-value 存储**（`KVDocumentStore`），以 `node_id` 为 key 存储完整 `BaseNode` 对象（文本、metadata、relationships 等）：
+- `add_documents(nodes)`：存入节点
+- `get_document(doc_id) → BaseNode`：按 ID 取节点
+- 维护 `ref_doc_id → [node_ids]` 映射（用于按源文档批量管理）
+- 维护文档哈希（用于去重和增量更新判断）
+
+### 检索时的协作流程
+
+```
+Retriever._retrieve()
+  ├─ embed query
+  ├─ vector_store.query()      ← 向量 ANN 搜索 → 得到相似 node_id 列表
+  ├─ docstore.get_nodes()      ← 用 node_id 去 docstore 取完整 Node 对象
+  └─ return List[NodeWithScore]
+```
+
+**一句话**：VectorStore 负责"找到哪些节点"（相似度），docstore 负责"这些节点是什么"（完整内容）。
+
+### Node 对应的是 chunk，不是原始文档
+
+**继承关系**：`Document` → `Node` → `BaseNode` (`schema.py:1097,638,264`)
+
+实际流程：
+1. `Document` 是用户输入的原始文档
+2. 通过 `NodeParser`/`SentenceSplitter` 将 Document 切分成多个 `Node`（chunk）
+3. 每个 chunk 生成 embedding，存入 VectorStore 和 docstore
+
+检索命中的 node 基本都是 chunk 而非原始文档。设计理念：**Document 是"用户所见"，Node 是"系统所用"**。
+
+---
+
+## 2026-06-17: 多 Retriever 共享同一个 Index
+
+### 多个 Retriever 不会互相干扰（读操作）
+
+`VectorIndexRetriever`（`retriever.py:24`）不持有数据，只持有 Index 的引用：
+
+```python
+self._index = index
+self._vector_store = self._index.vector_store   # line 61 — 共享引用
+self._docstore = self._index.docstore           # line 63 — 共享引用
+self._embed_model = embed_model or self._index._embed_model
+```
+
+- Retriever 只做读操作：`_vector_store.query()` + `_docstore.get_nodes()`，无任何写/删
+- 每个 Retriever 有独立的查询配置（`similarity_top_k`, `filters`, `query_mode`），存在自身实例变量里
+- 底层存储是指向同一个 Python 对象的引用，关键不存在"副本"问题
+
+### 并发写入时的可见性
+
+**正确路径**：通过 `index.insert_nodes()` → 同步更新三样：
+- `vector_store.add()` — 向量入库
+- `index_struct.add_node()` — 更新 `nodes_dict` 映射（向量 ID → node_id）
+- `docstore.add_documents()` — 节点内容入库
+
+三者指向同一个内存对象，其他 Retriever 立即可见。
+
+**绕过 Index 直接调 `vector_store.add()`**：向量入库了，但 `index_struct.nodes_dict` 不会更新。`VectorIndexRetriever._determine_nodes_to_fetch()`（`retriever.py:166`）查询时依赖 `nodes_dict` 把向量库返回的 ID 映射为 node_id，缺失映射会导致结果缺失或报错。
+
+---
+
+## 2026-06-17: MilvusVectorStore 的 flush 行为
+
+### 默认不自动 flush
+
+`add()`（`base.py:495-496`）：
+
+```python
+if add_kwargs.get("force_flush", False):
+    self.client.flush(self.collection_name)
+```
+
+只有显式传入 `force_flush=True` 才触发。`async_add` 直接不支持：
+
+```python
+if add_kwargs.get("force_flush", False):
+    raise NotImplementedError("force_flush is not supported in async mode.")
+```
+
+上层 `VectorStoreIndex._add_nodes_to_index()` 调用 `vector_store.add()` 时未传入 `force_flush`，所以默认路径不会 flush。
+
+### 为什么默认不 flush
+
+Milvus `consistency_level` 默认为 `"Session"`，growing segment 中 insert 的数据同 session 内立即可查，**不需要 flush 来保证可见性**。flush 的作用是将内存数据持久化到磁盘/对象存储，用于跨 session 持久化和崩溃恢复。
+
+### 批量导入时频繁 force_flush 的性能损耗
+
+**1. 强制落盘 I/O 阻塞**：每批 insert 后同步 flush 涉及磁盘/网络 I/O（几十~几百 ms 每次），百万级按 batch_size=100 就是 10000 次 flush，累积延迟巨大。
+
+**2. 海量碎片段**：每次 flush 封一个 sealed segment。频繁 flush 导致大量极小 segment，查询时需要跨大量 segment 合并结果，查询性能严重下降；同时触发频繁 segment compaction 消耗 CPU/IO。
+
+**3. 碎片化索引构建**：每次封段后 Milvus 为其构建向量索引，百条级别的小段建索引浪费 CPU，不如合并后在大段上集中构建。
+
+**建议**：大批量导入不传 `force_flush`，让 Milvus 自动管理 segment。导入完成后再手动调一次 `flush` 或依赖 auto-flush（内存阈值触发）。这也是 `_add_nodes_to_index` 默认不传 `force_flush` 的设计意图。
