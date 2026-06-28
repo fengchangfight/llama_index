@@ -51,3 +51,50 @@ This file documents methodologies, techniques, and analytical frameworks for cod
 ### 推广
 分析"最少需要实现什么"时，先找接口契约（Protocol/ABC），再追踪调用方的实际使用路径，两者取交集即可得到最小实现集。
 
+---
+
+## 2026-06-17: 存储写链路追踪法
+
+### 场景
+分析 `insert_nodes()` 数据分别写入 VectorStore / docstore / index_struct 三个存储层的过程，以及各层在一定条件下的"短路"行为。
+
+### 方法
+
+1. **从入口函数逐层下钻** — 从 `VectorStoreIndex.insert_nodes()` 出发，追踪 `_insert()` → `_add_nodes_to_index()` → `vector_store.add()` / `docstore.add_documents()` / `index_struct.add_node()` 的完整调用链。
+2. **关注条件分支** — 不在函数签名里找逻辑，而在函数体里找 `if` 分支。例如 `if not self._vector_store.stores_text or self._store_nodes_override` 决定了写不写 docstore；`if isinstance(node, (ImageNode, IndexNode))` 决定了哪些 Node 类型额外写入。
+3. **画多轨并行图** — 三个存储目标的写入不是原子事务，画出"先写谁后写谁、谁可能失败、失败后谁已经写入了"的完整状态空间。
+
+### 关键发现
+
+- TextNode + `stores_text=True`（Milvus 默认）场景下，docstore 完全不参与写入——数据一致性风险仅存在于 ImageNode/IndexNode。
+- `index_struct.nodes_dict` 对 Milvus（PK = node UUID）退化为恒等集 `UUID→UUID`，实际作用是"已知节点白名单"而非映射。
+- `node_to_metadata_dict` 自动写入的 `doc_id` 字段值 = `ref_doc_id`，不包含 index 级命名空间——这是多 Index 共享 Collection 时数据泄漏的根因。
+
+### 推广
+分析"数据写到了哪里"时，不要在接口层面猜测，必须追踪到实际的 `add()`/`add_documents()` 调用点，并检查条件分支——不同配置可能导致完全不同存储路径。
+
+---
+
+## 2026-06-17: 跨组件引用追踪法
+
+### 场景
+分析多个 Retriever 共享一个 Index 时是否会产生数据竞争，以及一个 Retriever 写入后另一个是否立即可见。
+
+### 方法
+
+1. **定位对象创建点** — 找到 Retriever 从 Index 获取 `vector_store` / `docstore` / `embed_model` 的赋值语句，确认是按值复制还是引用传递。
+2. **区分读写角色** — 检查 Retriever 调用的所有方法，区分：
+   - 纯读操作（`query`, `get_nodes`）
+   - 写操作（`add`, `delete`）
+3. **追踪 `**kwargs` 的流向** — LlamaIndex 大量使用 `**kwargs` 级联透传（`insert_nodes → _add_nodes_to_index → vector_store.add`），需要逐层确认参数是否完整到达目标。
+4. **验证共享路径** — 两个组件是否指向同一个 Python 对象引用（`id(a.vector_store) == id(b.vector_store)`），还是各自创建了副本。
+
+### 关键发现
+
+- Retriever 不拥有存储，只持有 Index 的引用——所有共享同一 Index 的 Retriever 指向同一个底层 `vector_store` 和 `docstore` 对象。
+- Retriever 自身只做读操作，不会互相干扰。但通过 Index 的写操作（`insert_nodes`）写入的数据立即可见（共享引用）。
+- `**kwargs` 的透传链已经在关键路径上打通：`insert_nodes` 的 `milvus_partition_name` → `_add_nodes_to_index` 的 `**insert_kwargs` → `vector_store.add()` 的 `**add_kwargs`。
+
+### 推广
+分析"两个组件是否共享状态"时，从持有者（Index）追踪属性赋值，确认是引用还是复制；然后追踪使用者的读写操作矩阵，区分只读共享（安全）和写写竞争（需同步）。
+

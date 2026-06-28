@@ -583,3 +583,306 @@ Milvus `consistency_level` 默认为 `"Session"`，growing segment 中 insert �
 **3. 碎片化索引构建**：每次封段后 Milvus 为其构建向量索引，百条级别的小段建索引浪费 CPU，不如合并后在大段上集中构建。
 
 **建议**：大批量导入不传 `force_flush`，让 Milvus 自动管理 segment。导入完成后再手动调一次 `flush` 或依赖 auto-flush（内存阈值触发）。这也是 `_add_nodes_to_index` 默认不传 `force_flush` 的设计意图。
+
+### consistency_level 的四种级别
+
+| 级别 | 写入 session 可见 | 跨 session 可见 | 说明 |
+|------|-----------|-----------|------|
+| `Strong` | ✅ | ✅ | 阻塞到 flush 完成才返回，任何连接立即可读 |
+| `Session` (默认) | ✅ | ❌ | 写 session 可读 growing segment，其他 session 要等 flush |
+| `Bounded` | ✅ | 限时最终可见 | 可读旧版，限时内收敛 |
+| `Eventually` | ✅ | 最终可见 | 不保证时间 |
+
+关键影响：如果两个不同服务实例共享 Milvus，实例 A 写入后实例 B 检索，在 flush 完成前 B 查不到（`Session` 模式下）。跨服务实例需要立即可见必须用 `Strong`，代价是每次 insert 阻塞等落盘。
+
+---
+
+## 2026-06-17: Milvus Segment 与 HNSW 索引架构
+
+### 核心模型：每个 sealed segment 独立持有一个 HNSW
+
+```
+Growing Segment (内存, 可写, 无索引)
+  └─ insert 写入
+       ↓ (达到阈值: 大小/时间)
+  Sealed Segment (不可变) → 建立独立 HNSW 图
+       ↓ (小段过多)
+  Compaction → 合并多个小 sealed segment → 建一个统一的大 HNSW
+       ↓ (段过大)
+  Index Compaction → 优化重建 HNSW 图
+```
+
+关键特性：
+- sealed segment 不可变 → 其上的 HNSW 图也终生只读、不修改
+- 多 segment 不共享 HNSW，查询时**并行搜索所有 sealed segment 各自的索引**，然后 reduce TOP-K 归并结果
+- 这就是频繁 flush 产生大量小段导致查询性能差的根因：搜 N 个小图 + 合并结果的开销远大于搜一个大图
+
+### Compaction 是自动的，无需手动介入
+
+Milvus 的 DataCoord 内置自动 compaction 策略：
+
+| 类型 | 触发条件 | 动作 |
+|------|---------|------|
+| Small Segment Compaction | sealed segment 数量/小段占比超阈值 | 多小段合并为大段 → 建新 HNSW |
+| Index Compaction | 单段过大、索引老化 | 重建更优 HNSW 图 |
+
+手动 `compact()` 只是特殊场景的补充（如导入完成后手动触发加速收敛），**长期运维依赖的是 auto-compaction**。
+
+### 正确的写入策略总结
+
+不要在应用层做以下操作：
+- ❌ 每批 insert 后手传 `force_flush=True` — 产生海量碎片段
+- ❌ 手动频繁 `compact()` — 干扰 DataCoord 的策略调度
+
+应该做的：
+- ✅ insert 不传 `force_flush`，让数据在 growing segment 积累
+- ✅ 依赖 auto-seal + auto-compaction 自动管理 segment 生命周期
+- ✅ 导入全量完成后可调一次 `flush`（确保落盘），后续交给自动机制
+
+---
+
+## 2026-06-17: 多 Index 共享单个 Milvus Collection 的并发与隔离
+
+### 核心风险：两条查询路径都有隔离漏洞
+
+**背景**：`node_to_metadata_dict`（`core/vector_stores/utils.py:71-73`）会自动给节点 metadata 加 `doc_id`、`document_id`、`ref_doc_id`，但值都是 `node.ref_doc_id`（源文档哈希），**没有任何 index 级别的命名空间标识**。
+
+**查询的两种路径**（`VectorIndexRetriever._determine_nodes_to_fetch`，`retriever.py:146-170`）：
+
+```python
+if query_result.nodes:      # 路径A: Milvus 直接返回完整 Node (stores_text=True)
+    # → 只过滤出非 TEXT 类型 (ImageNode/IndexNode 才需查 docstore)
+    # → TextNode 直接使用, 不经过 nodes_dict 校验
+    return [node.node_id for node in query_result.nodes
+            if node.as_related_node_info().node_type != ObjectType.TEXT]
+
+elif query_result.ids:      # 路径B: Milvus 只返回 ID 列表
+    # → 用本 Index 的 nodes_dict 做 ID→UUID 映射
+    return [self._index.index_struct.nodes_dict[idx] for idx in query_result.ids]
+```
+
+- **路径 A**（最常见的 TextNode + stores_text=True）：Milvus 返回的所有节点直接使用，**不过滤**，Index A 检索直接泄露 Index B 的数据
+- **路径 B**（非 TextNode 或 stores_text 关闭）：`nodes_dict` 是每个 Index 私有的，查不到其他 Index 的 ID → 直接抛 `KeyError`
+
+### 五种并发/数据问题
+
+| 问题 | 严重程度 | 根因 |
+|------|---------|------|
+| **数据泄露** | 高 | 路径 A 无过滤，TextNode 跨 Index 直接可见 |
+| **KeyError 崩溃** | 高 | 路径 B 中 nodes_dict 不包含其他 Index 的 ID |
+| **删除扩散** | 高 | `delete(ref_doc_id)` 无分区范围限制，误删其他 Index 数据 |
+| **Schema 冲突** | 中 | 共用集合强制相同向量维度、字段类型、索引配置 |
+| **nodes_dict 语义退化** | 低 | 对 Milvus（PK=UUID），`nodes_dict` 退化为 UUID→UUID 恒等集 |
+
+### 隔离方案对比
+
+| 方案 | 原理 | 改动量 | 性能 | 适用场景 |
+|------|------|--------|------|---------|
+| **① Milvus Partition（推荐）** | 每 Index 一个分区，物理层隔离 | 中 | 最优，原生无额外开销 | 需要共享集合的多数场景 |
+| **② Metadata Filter** | 节点加 `index_namespace` 字段，查询 filter | 中 | 需扫描过滤 | 需要跨 Index 查询能力的场景 |
+| **③ 独立 Collection** | 每 Index 一个集合 | 小 | 无干扰 | 不介意多集合管理 |
+| **④ doc_ids Filter** | 将 `ref_doc_id` 重写为 index 级标识 | 小 | 过滤扫描 | ❌ 不推荐（语义污染） |
+
+### 方案① Partition 详细设计
+
+```
+Milvus Collection "shared"
+  ├─ Partition "index_A"    ← Index A 数据
+  ├─ Partition "index_B"    ← Index B 数据
+  └─ Partition "index_C"    ← Index C 数据
+```
+
+**写入链路已打通**：`insert_nodes(**insert_kwargs)` → `_add_nodes_to_index` → `vector_store.add(nodes_batch, **insert_kwargs)`：
+
+```python
+index.insert_nodes(nodes, milvus_partition_name="index_A")
+```
+
+**检索链路已打通**：`VectorIndexRetriever.__init__` 中 `self._kwargs = kwargs.get("vector_store_kwargs", {})`，查询时 `self._vector_store.query(query, **self._kwargs)`：
+
+```python
+retriever = index.as_retriever(
+    vector_store_kwargs={"milvus_partition_names": ["index_A"]}
+)
+```
+
+**删除链路**：`delete(ref_doc_id, milvus_partition_name="index_A")`
+
+### 额外注意事项
+
+- **docstore 必须独立**：每个 Index 有独立 `docstore`（ImageNode/IndexNode 仍需它）
+- **index_struct 天然隔离**：每个 Index 的 `IndexDict` 在内存中独立
+- **Partition 上限**：单集合 4096 个分区
+- **跨 Index 查询**：传多个 partition name 即可天然支持
+
+---
+
+## 2026-06-17: consistency_level 跨 Session 可见性
+
+### 四种级别
+
+| 级别 | 写入 session 可见 | 跨 session 可见 | 说明 |
+|------|-----------|-----------|------|
+| `Strong` | ✅ | ✅ | 每次 insert 阻塞等 flush 完成，任何连接立即可读 |
+| `Session` (默认) | ✅ | ❌ | growing segment 只对写入 session 可见，其他 session 需等 seal+flush |
+| `Bounded` | ✅ | 限时最终可见 | 可读到旧版本，限时内收敛 |
+| `Eventually` | ✅ | 最终可见 | 不保证收敛时间 |
+
+### 根因
+
+Milvus 中 growing segment（内存 buffer）只对写入它的 session 开放。新客户端连接 = 新 session，只能看到 sealed segment（flush 后的持久化段）。默认 `consistency_level="Session"` 下，跨服务实例的数据立即可见必须在 insert 后 flush。
+
+### 场景对照
+
+| 场景 | 写后立即可查？ | 建议 |
+|------|--------------|------|
+| 同一进程内 Index→Retriever | ✅ | 默认 Session 即可 |
+| 微服务 A 写, 微服务 B 查 | ❌ | flush 或改用 Strong |
+| 单文档上传即搜 | flush 一次（几十 ms） | 不要用 Strong（每批 insert 都阻塞） |
+
+---
+
+## 2026-06-28: 去重机制全链路详解
+
+### 核心结论
+
+两次 ingest 同一个未变化的文档，默认配置下第二次**不做任何操作**（不 chunk、不 embed、不写向量库）。
+
+### 机制总览
+
+```
+文档/Document
+  │
+  ├─ 1. 哈希计算: BaseNode.hash → SHA-256(content + metadata)
+  │     schema.py:741-803 (各子类实现)
+  │
+  ├─ 2. 哈希存储: Docstore._metadata_collection → {doc_hash → doc_id}
+  │     keyval_docstore.py:599-669
+  │
+  ├─ 3. 预处理判断: IngestionPipeline._handle_upserts / _handle_duplicates
+  │     pipeline.py:451-507
+  │     ├─ DUPLICATES_ONLY: 遍历所有已存 hash，存在则跳过
+  │     ├─ UPSERTS (默认): 按 ref_doc_id 查 hash，相同跳过，变化则更新
+  │     └─ UPSERTS_AND_DELETE: 同 UPSERTS + 删除本次未出现的旧文档
+  │
+  └─ 4. 批次内去重: current_hashes 集合，同一次 run 内的重复文档也合并
+```
+
+### 1. 哈希计算（文档身份的唯一标识）
+
+定义在 `core/schema.py`，`BaseNode` 的 `hash` 属性为抽象方法，各子类独立实现：
+
+| 节点类型 | 行号 | 哈希构成 |
+|---------|------|---------|
+| `TextNode` | 800-803 | `sha256(text + str(metadata))` |
+| `Node` (多模态) | 741-762 | `sha256(metadata_str + audio_hash + image_hash + text_resource_hash + video_hash)` |
+| `ImageNode` | 913-922 | `sha256(image_str + image_path_str + image_url_str + text)` |
+| `MediaResource` | 605-635 | `sha256(text + sha256(data) + sha256(path) + sha256(url))` |
+
+关键设计点：
+- hash 是**即时计算**的（`@property`），不作为字段持久化存储（`schema.py:272-273` 注释：`hash is computed on local field, during the validation process`）
+- metadata 包含在 hash 输入中 → metadata 变了也会触发重新 ingest
+- `MediaResource` 用了三层哈希（对 data/path/url 分别 sha256 再合并），保证无论数据来自哪个来源都能正确去重
+
+### 2. 哈希存储（Docstore 中的元数据层）
+
+`Docstore` 除了存储节点本身，还维护一个独立的 `_metadata_collection` 用于哈希映射：
+
+```
+KVDocumentStore
+  ├─ _kvstore        ← 节点内容 (key: node_id, value: BaseNode)
+  └─ _metadata_collection ← 哈希映射 (key: doc_id, value: {"doc_hash": "..."})
+```
+
+核心方法（`keyval_docstore.py:599-669`）：
+
+| 方法 | 行号 | 作用 |
+|------|------|------|
+| `set_document_hash(doc_id, doc_hash)` | 599-602 | 存单个 hash |
+| `get_document_hash(doc_id)` | 633-639 | 按 doc_id 取 hash |
+| `get_all_document_hashes()` | 651-659 | 返回 `{hash: doc_id}` 全量映射（注意 key 是 hash 值） |
+| `set_document_hashes(doc_hashes)` | 604-614 | 批量存入 |
+| `delete_document(doc_id)` | — | 同时删除节点和其 hash 记录 |
+
+### 3. IngestionPipeline 去重判断（pipeline.py:451-507）
+
+#### DUPLICATES_ONLY 模式 (`_handle_duplicates`)
+
+```
+对每个 node:
+  1. 从 docstore 获取所有已存在的 document hash 集合 (existing_hashes)
+  2. 与当前批次的 hash 集合 (current_hashes) 合并
+  3. 如果 node.hash NOT IN (existing_hashes ∪ current_hashes) → 新节点，加入处理队列
+  4. 如果 node.hash 已存在 → 跳过
+```
+
+#### UPSERTS 模式 (`_handle_upserts`)
+
+```
+对每个 node:
+  1. 提取 ref_doc_id（源文档 ID，多个 chunk 共享同一 ref_doc_id）
+  2. 查 docstore 获取该 ref_doc_id 对应的 existing_hash
+  3. existing_hash 为 None → 新文档，加入处理队列
+  4. existing_hash != node.hash → 文档已变化，删除旧的（vector_store + docstore），重新 ingest
+  5. existing_hash == node.hash → 跳过（核心去重逻辑！）
+```
+
+UPSERTS_AND_DELETE 在 upserts 基础上额外收集"本次 run 中未出现的旧 ref_doc_id"，统一删除。
+
+### 4. 批次内去重
+
+`current_hashes` 是一个 set，在同一次 `run()` 调用内追踪已处理节点的 hash。同一批次中有两个内容相同的文档，第二个直接跳过。这意味着即使不用 docstore（内存模式），也能避免同一批次内的重复处理。
+
+### 5. 智能降级（pipeline.py:590-604）
+
+| 条件 | 行为 |
+|------|------|
+| 有 docstore + 有 vector_store | 按配置策略执行（UPSERTS/DUPLICATES_ONLY/UPSERTS_AND_DELETE） |
+| 有 docstore + 无 vector_store + 策略 != DUPLICATES_ONLY | 自动降级为 DUPLICATES_ONLY + 发出 Warning |
+| 无 docstore | 不去重，直接处理所有输入 |
+
+降级逻辑的设计理念：**"不崩溃，给提示"** — 配置不兼容时自动退化为最安全策略。
+
+### 6. Index 级别的增量刷新（`refresh_ref_docs`）
+
+`core/indices/base.py:440-480` 提供了另一种去重路径 — 不经过 IngestionPipeline，直接在已有 Index 上刷新文档：
+
+```
+refresh_ref_docs(documents):
+  对每个 document:
+    existing_hash = docstore.get_document_hash(doc.doc_id)
+    if existing_hash is None       → insert()      # 新文档
+    elif existing_hash != doc.hash → update_ref_doc()  # 文档已变化
+    else                           → skip          # 未变化，跳过
+```
+
+与 IngestionPipeline 的区别：`refresh_ref_docs` 在 Index 层面直接操作，不经过完整的 transformation 管道。
+
+### 7. PropertyGraphIndex 去重
+
+`core/indices/property_graph/base.py:244-249`：在插入图节点前，先从 graph_store 拉取已存在的相同 ID 节点，计算 `existing_node_hashes`，过滤掉 hash 已在图中的节点。
+
+### 8. 检索层面的去重
+
+以上是**摄入去重**。检索结果也有去重，但粒度不同：
+
+| 位置 | 去重键 | 文件:行号 |
+|------|--------|-----------|
+| Recursive Retriever | `node.id_` | `retrievers/recursive_retriever.py:68-82` |
+| Property Graph Retriever | `node.text` | `indices/property_graph/retriever.py:41-49` |
+| Fusion Retriever (RRF) | `node.hash` | `retrievers/fusion_retriever.py:120-148` |
+| Vector Store (hybrid search) | `node_id` | 多个 vector store 的 `_dedup_results()` |
+
+### 9. URL 级别预去重
+
+`readers/web/async_web/base.py:64`：网页读取器在抓取前对 URL 列表做 `list(dict.fromkeys(urls))` 去重，属于 IoC 之前的最轻量去重。
+
+### 设计理念总结
+
+| 理念 | 体现 |
+|------|------|
+| **内容寻址 (Content-Addressable)** | SHA-256 hash 作为文档唯一标识，内容不变 hash 不变 |
+| **元数据敏感** | metadata 参与 hash 计算，改 metadata 等价于文档变化 |
+| **分层去重** | URL 层 → Pipeline 层 → Index 层 → 检索层，各层粒度不同 |
+| **失败安全** | 配置不兼容时自动降级，不崩溃 |
+| **读写分离** | 摄入去重（写路径）与检索去重（读路径）机制独立 |
